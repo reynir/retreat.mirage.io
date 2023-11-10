@@ -1,37 +1,5 @@
 open Mirage
 
-let dns_key =
-  let doc = Key.Arg.info ~doc:"nsupdate key (name:type:value,...)" ["dns-key"] in
-  Key.(create "dns-key" Arg.(required string doc))
-
-let dns_server =
-  let doc = Key.Arg.info ~doc:"dns server IP" ["dns-server"] in
-  Key.(create "dns-server" Arg.(required ip_address doc))
-
-let dns_port =
-  let doc = Key.Arg.info ~doc:"dns server port" ["dns-port"] in
-  Key.(create "dns-port" Arg.(opt int 53 doc))
-
-let key =
-  let doc = Key.Arg.info ~doc:"certificate key (<type>:seed or b64)" ["key"] in
-  Key.(create "key" Arg.(required string doc))
-
-let monitor =
-  let doc = Key.Arg.info ~doc:"monitor host IP" ["monitor"] in
-  Key.(create "monitor" Arg.(opt (some ip_address) None doc))
-
-let syslog =
-  let doc = Key.Arg.info ~doc:"syslog host IP" ["syslog"] in
-  Key.(create "syslog" Arg.(opt (some ip_address) None doc))
-
-let name =
-  let doc = Key.Arg.info ~doc:"Name of the unikernel" ["name"] in
-  Key.(create "name" Arg.(opt string "retreat.mirage.io" doc))
-
-let no_tls =
-  let doc = Key.Arg.info ~doc:"Disable TLS" [ "no-tls" ] in
-  Key.(create "no-tls" Arg.(flag doc))
-
 (* uTCP *)
 
 let tcpv4v6_direct_conf id =
@@ -57,33 +25,95 @@ let net =
   let i6 = create_ipv6 default_network ethernet in
   let i4i6 = create_ipv4v6 i4 i6 in
   let tcpv4v6 = direct_tcpv4v6 "service" i4i6 in
-  let ipv4_only = Key.ipv4_only () in
-  let ipv6_only = Key.ipv6_only () in
+  let ipv4_only = Runtime_key.ipv4_only () in
+  let ipv6_only = Runtime_key.ipv6_only () in
   direct_stackv4v6 ~tcp:tcpv4v6 ~ipv4_only ~ipv6_only default_network ethernet arp i4 i6
 
+let enable_monitoring =
+  let doc = Cmdliner.Arg.info
+      ~doc:"Enable monitoring (only available for solo5 targets)"
+      [ "enable-monitoring" ]
+  in
+  Key.(create "enable-monitoring" Arg.(flag doc))
+
 let management_stack =
-  generic_stackv4v6 ~group:"management" (netif ~group:"management" "management")
+  if_impl
+    (Key.value enable_monitoring)
+    (generic_stackv4v6 ~group:"management" (netif ~group:"management" "management"))
+    net
+
+let (name : string Runtime_key.key) = Runtime_key.create "Unikernel.K.name"
+
+let monitoring =
+  let monitor = Runtime_key.create "Unikernel.K.monitor" in
+  let connect _ modname = function
+    | [ _ ; _ ; stack ] ->
+      Fmt.str "Lwt.return (match %a with\
+               | None -> Logs.warn (fun m -> m \"no monitor specified, not outputting statistics\")\
+               | Some ip -> %s.create ip ~hostname:%a %s)"
+        Runtime_key.call monitor modname
+        Runtime_key.call name stack
+    | _ -> assert false
+  in
+  impl
+    ~packages:[ package "mirage-monitoring" ]
+    ~runtime_keys:[ Runtime_key.v name ; Runtime_key.v monitor ]
+    ~connect "Mirage_monitoring.Make"
+    (time @-> pclock @-> stackv4v6 @-> job)
+
+let syslog =
+  let syslog = Runtime_key.create "Unikernel.K.syslog" in
+  let connect _ modname = function
+    | [ _ ; stack ] ->
+      Fmt.str "Lwt.return (match %a with\
+               | None -> Logs.warn (fun m -> m \"no syslog specified, dumping on stdout\")\
+               | Some ip -> Logs.set_reporter (%s.create %s ip ~hostname:%a ()))"
+        Runtime_key.call syslog modname stack
+        Runtime_key.call name
+    | _ -> assert false
+  in
+  impl
+    ~packages:[ package ~sublibs:["mirage"] ~min:"0.4.0" "logs-syslog" ]
+    ~runtime_keys:[ Runtime_key.v name ; Runtime_key.v syslog ]
+    ~connect "Logs_syslog_mirage.Udp"
+    (pclock @-> stackv4v6 @-> job)
+
+type i0 = I0
+let i0 = Functoria.Type.v I0
+let no0 = Functoria.impl "Int" job
+
+type n1 = N1
+let n1 = Functoria.Type.v N1
+let noop1 = Functoria.impl "Set.Make" (job @-> job)
+
+let optional_monitoring time pclock stack =
+  if_impl (Key.value enable_monitoring)
+    (monitoring $ time $ pclock $ stack)
+    (noop1 $ no0)
+
+let optional_syslog pclock stack =
+  if_impl (Key.value enable_monitoring)
+    (syslog $ pclock $ stack)
+    (noop1 $ no0)
 
 let packages = [
   package "logs" ;
   package "cmarkit" ;
   package ~min:"3.7.1" "tcpip" ;
-  package "mirage-monitoring" ;
-  package ~sublibs:["mirage"] ~min:"0.4.0" "logs-syslog" ;
   package ~min:"6.1.1" ~sublibs:["mirage"] "dns-certify";
   package "tls-mirage";
   package ~min:"4.3.1" "mirage-runtime";
 ]
 
+let retreat =
+  foreign
+    ~packages
+    "Unikernel.Main"
+    (random @-> time @-> pclock @-> stackv4v6 @-> job)
+
 let () =
   register "retreat" [
-    foreign
-      ~keys:[
-        Key.v dns_key ; Key.v dns_server ; Key.v dns_port ; Key.v key ;
-        Key.v name ; Key.v syslog ; Key.v monitor ; Key.v no_tls ;
-      ]
-      ~packages
-      "Unikernel.Main"
-    (random @-> time @-> pclock @-> stackv4v6 @-> stackv4v6 @-> job)
-    $ default_random $ default_time $ default_posix_clock $ net $ management_stack
+    optional_syslog default_posix_clock management_stack ;
+    optional_monitoring default_time default_posix_clock management_stack ;
+    retreat $ default_random $ default_time $ default_posix_clock $ net ;
   ]
