@@ -33,6 +33,8 @@ module K = struct
     let doc = Arg.info ~doc:"Name of the unikernel" [ "name" ] in
     Arg.(value & opt string "a.ns.robur.coop" doc)
 
+  let hostname = name |> Mirage_runtime.key
+
   let monitor =
     let doc = Arg.info ~doc:"monitor host IP" [ "monitor" ] in
     Arg.(value & opt (some ip) None doc)
@@ -93,7 +95,7 @@ module Main (R : Mirage_random.S) (T : Mirage_time.S) (P : Mirage_clock.PCLOCK) 
     (if not (K.no_tls ()) then
        match
          let ( let* ) = Result.bind in
-         let* hostname = Domain_name.of_string ((K.name |> Mirage_runtime.key) ()) in
+         let* hostname = Domain_name.of_string (K.hostname ()) in
          let* hostname = Domain_name.host hostname in
          let* key = Option.to_result ~none:(`Msg "no key provided") (K.key ()) in
          let* key_type, key_data, key_seed =
